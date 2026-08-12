@@ -1,57 +1,5 @@
 # proxy-scraper
 
-每天通过 GitHub Actions 自动登录 [北极光代理](https://proxy-socks5.com/)，
-抓取代理列表**第 1 页**（30 条），结果写入仓库 `proxies/` 目录，并同步更新到一个 GitHub Gist。
-
-## 目录结构
-
-```
-.
-├── scrape.py                     # 登录 + 抓取 + 解析 + 写文件
-├── upload_gist.py                # 把最新结果同步到 Gist
-├── requirements.txt
-├── proxies/                      # 抓取结果输出目录（脚本自动生成）
-│   ├── latest.txt                # ip:port 每行一条，始终是最新结果
-│   ├── latest.json                # 结构化最新结果（含类型、地理信息、抓取时间等）
-│   ├── 2026-08-12.txt             # 每日归档快照
-│   └── 2026-08-12.json
-└── .github/workflows/scrape.yml  # 定时任务
-```
-
-## 抓取逻辑说明
-
-该网站未登录时会把 IP 打码（例如 `37.9.X.127`），登录后才显示完整 IP。
-脚本支持两种登录方式，**优先使用 Cookie**：
-
-- **方式 A：Cookie（推荐）** —— 设置 `SITE_COOKIE`，脚本直接把这个
-  Cookie 灌进请求session，不走登录表单，最稳定、不受表单结构变化影响。
-- **方式 B：账号密码** —— 未设置 `SITE_COOKIE` 时，用 `SITE_USERNAME` /
-  `SITE_PASSWORD` 自动解析并提交登录页的 `<form>`（自动识别哪个输入框
-  是用户名、哪个是密码，不需要写死字段名）。
-
-登录（或 Cookie 验证）成功后，请求
-`https://proxy-socks5.com/proxy_list?page=1`，解析表格，用正则从每一行
-提取 `ip:port`（该站点 IP 列本身就是"类型 + ip:port"的组合文本，正则比
-按列下标取值更稳），附加字段（类型 / 地理信息等）按表头关键字对齐。
-
-**天然的登录状态自检**：如果 Cookie 过期或登录失败，页面上的 IP 仍然是
-打码状态（带字母 `X`），正则无法匹配出合法 IP，最终 `proxies/latest.txt`
-会是空的，脚本也会打印警告 —— 空结果基本就意味着没登录成功。
-
-### 怎么拿 Cookie
-
-1. 浏览器登录 https://proxy-socks5.com/ 。
-2. 打开开发者工具 F12 → Network（网络）标签。
-3. 刷新一下代理列表页，随便点开一个请求（比如 `proxy_list`）。
-4. 在请求头（Request Headers）里找到 `Cookie:` 那一整行，复制冒号后面
-   的完整内容（形如 `session=xxxx; other=yyy`）。
-5. 存到 GitHub Secret `SITE_COOKIE` 里。
-
-> 注意：Cookie 通常有过期时间（几天到几十天不等，取决于网站设置）。
-> 如果某天脚本突然抓不到数据了，大概率是 Cookie 过期，重新登录复制一次
-> 新的 Cookie、更新 Secret 即可。如果嫌手动更新麻烦，可以改用方式 B
-> （账号密码），密码不会过期，缺点是依赖登录表单结构不变。
-
 ## 快速开始
 
 ### 1. 建仓库
