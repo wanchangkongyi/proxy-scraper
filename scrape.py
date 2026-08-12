@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-北极光代理（proxy-socks5.com）第 1 页代理抓取脚本。
+北极光代理（proxy-socks5.com）第 1 页代理抓取脚本（单文件版）。
+
+依赖：requests, beautifulsoup4
+    pip install requests beautifulsoup4
 
 登录方式（二选一，优先 Cookie）：
   A. Cookie 登录（推荐）：设置 SITE_COOKIE 环境变量为浏览器登录后
@@ -12,10 +15,10 @@
 流程：
   1. 建立已认证的 session（Cookie 或 表单登录二选一）。
   2. 请求代理列表第 1 页（PROXY_LIST_URL）。
-  3. 解析表格，得到 ip:port（以及类型、地理信息等附加字段）。
-  4. 写入 proxies/ 目录：
-       - proxies/latest.json / proxies/latest.txt   最新一次结果
-       - proxies/YYYY-MM-DD.json / .txt             当日归档快照
+  3. 解析表格，得到 协议://ip:端口。
+  4. 写入 proxies/latest.txt（每次覆盖，只保留最新一份结果，
+     不再生成按日期归档的文件）。
+  5. 如果配置了 GIST_TOKEN + GIST_ID，把 latest.txt 的内容同步更新到 Gist。
 
 注意：未登录状态下网站会把 IP 打码（例如 37.9.X.127），此时正则
 无法匹配出合法 IP，因此如果本次抓取结果为空，大概率是 Cookie 已过期
@@ -26,7 +29,6 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
 from urllib.parse import urljoin
 
 import requests
@@ -39,22 +41,25 @@ SITE_USERNAME = os.environ.get("SITE_USERNAME")
 SITE_PASSWORD = os.environ.get("SITE_PASSWORD")
 
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "proxies")
+OUTPUT_FILE = os.path.join(OUTPUT_DIR, "latest.txt")
+
+GIST_TOKEN = os.environ.get("GIST_TOKEN")
+GIST_ID = os.environ.get("GIST_ID")
+GIST_FILENAME = os.environ.get("GIST_FILENAME", "proxies_latest.txt")
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 REQUEST_TIMEOUT = 30
 
+# 匹配 "socks5 1.2.3.4:1080" / "http 1.2.3.4:1080" 这种 "协议 + ip:port" 组合文本
+PROXY_RE = re.compile(
+    r"\b(socks5|socks4|http|https)\s+(\d{1,3}(?:\.\d{1,3}){3})\s*[:：]\s*(\d{2,5})\b",
+    re.IGNORECASE,
+)
+# 兜底：只匹配 ip:port，协议未知时标记为 unknown
 IP_PORT_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\s*[:：]\s*(\d{2,5})\b")
-IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
-
-# 表头关键字 -> 输出字段名（同时兼容中英文表头）
-COLUMN_ALIASES = {
-    "type": ("type", "protocol", "类型"),
-    "country": ("country", "地理信息", "地区", "位置"),
-    "anonymity": ("anonymity", "匿名度", "匿名"),
-    "added_at": ("last_checked", "last checked", "入库", "更新时间"),
-}
 
 
 def _headers():
@@ -62,10 +67,7 @@ def _headers():
 
 
 def apply_cookie(session: requests.Session, raw_cookie: str) -> bool:
-    """
-    把浏览器复制出来的原始 Cookie 字符串（如 "a=1; b=2"）灌进 session，
-    然后请求代理列表页验证是否真的处于登录状态。
-    """
+    """把浏览器复制出来的原始 Cookie 字符串灌进 session，并验证是否登录成功。"""
     for part in raw_cookie.split(";"):
         part = part.strip()
         if not part or "=" not in part:
@@ -140,21 +142,19 @@ def login(session: requests.Session, login_url: str, username: str, password: st
     if "退出登录" in login_resp.text:
         return True
 
-    # 有的站点登录后会重定向，登录响应本身不含"退出登录"，再访问列表页确认一次
     check_resp = session.get(PROXY_LIST_URL, headers=_headers(), timeout=REQUEST_TIMEOUT)
     return "退出登录" in check_resp.text
 
 
-def _match_column(header_cells, keywords):
-    for i, h in enumerate(header_cells):
-        if any(k in h for k in keywords):
-            return i
-    return None
-
-
-def parse_table(html: str):
+def parse_proxies(html: str):
+    """
+    解析代理列表表格，返回 "协议://ip:端口" 字符串列表。
+    优先匹配 "协议 + ip:port" 组合文本（该站点表格就是这种格式），
+    找不到协议前缀时退化为 unknown://ip:port。
+    """
     soup = BeautifulSoup(html, "html.parser")
-    proxies = []
+    results = []
+    seen = set()
 
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
@@ -162,84 +162,71 @@ def parse_table(html: str):
             continue
 
         header_cells = [c.get_text(strip=True).lower() for c in rows[0].find_all(["th", "td"])]
-        ip_idx = _match_column(header_cells, ("ip",))
-        if ip_idx is None:
+        if not any("ip" in h for h in header_cells):
             continue
-
-        extra_idx = {}
-        for field, keywords in COLUMN_ALIASES.items():
-            idx = _match_column(header_cells, keywords)
-            if idx is not None:
-                extra_idx[field] = idx
 
         for row in rows[1:]:
             cells = [c.get_text(strip=True) for c in row.find_all("td")]
             if not cells:
                 continue
+            row_text = " ".join(cells)
 
-            # 该站点的 IP 列本身就是 "ip:port"（有时还带类型徽标），
-            # 所以统一用正则从整行文本里提取，比按下标取值更稳。
-            m = IP_PORT_RE.search(" ".join(cells))
-            if not m:
+            m = PROXY_RE.search(row_text)
+            if m:
+                protocol, ip, port = m.group(1).lower(), m.group(2), m.group(3)
+            else:
+                m2 = IP_PORT_RE.search(row_text)
+                if not m2:
+                    continue
+                protocol, ip, port = "unknown", m2.group(1), m2.group(2)
+
+            key = f"{protocol}://{ip}:{port}"
+            if key in seen:
                 continue
-            ip, port = m.group(1), m.group(2)
-            if not (IP_RE.match(ip) and port.isdigit()):
-                continue
+            seen.add(key)
+            results.append(key)
 
-            entry = {"ip": ip, "port": port}
-            for field, idx in extra_idx.items():
-                if idx < len(cells) and cells[idx]:
-                    entry[field] = cells[idx]
+        if results:
+            return results
 
-            proxies.append(entry)
-
-        if proxies:
-            return proxies
-
-    # 兜底：整页纯文本正则扫描（注意：未登录时 IP 会被打码成 X，
-    # 正则匹配不到，天然就是一个"是否登录成功"的信号）
+    # 兜底：整页纯文本正则扫描
     text = soup.get_text(" ")
-    for m in IP_PORT_RE.finditer(text):
-        proxies.append({"ip": m.group(1), "port": m.group(2)})
+    for m in PROXY_RE.finditer(text):
+        key = f"{m.group(1).lower()}://{m.group(2)}:{m.group(3)}"
+        if key not in seen:
+            seen.add(key)
+            results.append(key)
 
-    return proxies
-
-
-def dedupe(proxies):
-    seen = set()
-    result = []
-    for p in proxies:
-        key = f"{p['ip']}:{p['port']}"
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(p)
-    return result
+    return results
 
 
-def write_outputs(proxies, output_dir: str):
-    os.makedirs(output_dir, exist_ok=True)
-    now = datetime.now(timezone.utc)
-    date_str = now.strftime("%Y-%m-%d")
+def write_output(proxies):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        for line in proxies:
+            f.write(line + "\n")
+    return OUTPUT_FILE
 
-    payload = {
-        "source": PROXY_LIST_URL,
-        "scraped_at": now.isoformat(),
-        "count": len(proxies),
-        "proxies": proxies,
-    }
 
-    for prefix in (date_str, "latest"):
-        json_path = os.path.join(output_dir, f"{prefix}.json")
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+def upload_gist(proxies):
+    if not GIST_TOKEN or not GIST_ID:
+        print("未配置 GIST_TOKEN / GIST_ID，跳过 Gist 同步。")
+        return
 
-        txt_path = os.path.join(output_dir, f"{prefix}.txt")
-        with open(txt_path, "w", encoding="utf-8") as f:
-            for p in proxies:
-                f.write(f"{p['ip']}:{p['port']}\n")
-
-    return os.path.join(output_dir, "latest.json"), os.path.join(output_dir, "latest.txt")
+    content = "\n".join(proxies) + "\n" if proxies else "# 本次运行未解析到任何代理\n"
+    resp = requests.patch(
+        f"https://api.github.com/gists/{GIST_ID}",
+        headers={
+            "Authorization": f"token {GIST_TOKEN}",
+            "Accept": "application/vnd.github+json",
+        },
+        data=json.dumps({"files": {GIST_FILENAME: {"content": content}}}),
+        timeout=REQUEST_TIMEOUT,
+    )
+    if resp.status_code != 200:
+        print(f"ERROR: 更新 Gist 失败 ({resp.status_code}): {resp.text}", file=sys.stderr)
+        return
+    print(f"Gist 已更新: {resp.json().get('html_url')}")
 
 
 def main():
@@ -252,7 +239,6 @@ def main():
         except requests.RequestException as e:
             print(f"ERROR: 用 Cookie 访问代理列表失败: {e}", file=sys.stderr)
             sys.exit(1)
-
         if not ok:
             print(
                 "ERROR: Cookie 似乎已失效（响应里没有找到'退出登录'字样）。"
@@ -269,7 +255,6 @@ def main():
         except requests.RequestException as e:
             print(f"ERROR: 登录请求失败: {e}", file=sys.stderr)
             sys.exit(1)
-
         if not ok:
             print(
                 "ERROR: 登录似乎失败了（响应里没有找到'退出登录'字样）。"
@@ -294,20 +279,21 @@ def main():
         print(f"ERROR: 抓取代理列表失败: {e}", file=sys.stderr)
         sys.exit(1)
 
-    proxies = dedupe(parse_table(resp.text))
+    proxies = parse_proxies(resp.text)
     print(f"解析到 {len(proxies)} 条代理。")
 
     if not proxies:
         print(
             "WARNING: 未解析到任何代理。若确实已登录，IP 不应该被打码，"
-            "多半是页面结构变化导致解析失败，请检查 HTML 并调整 "
-            "parse_table() 的表头关键字；如果怀疑是登录/Cookie 失效，"
+            "多半是页面结构变化导致解析失败；如果怀疑是登录/Cookie 失效，"
             "重新检查 SITE_COOKIE 或 SITE_USERNAME/SITE_PASSWORD。",
             file=sys.stderr,
         )
 
-    latest_json, latest_txt = write_outputs(proxies, OUTPUT_DIR)
-    print(f"已写入 {latest_json} 和 {latest_txt}")
+    output_path = write_output(proxies)
+    print(f"已写入 {output_path}")
+
+    upload_gist(proxies)
 
 
 if __name__ == "__main__":
