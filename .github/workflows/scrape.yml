@@ -22,13 +22,15 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install requests beautifulsoup4
 
-      - name: Run scraper
+      - name: Run scraper (scrape + write file + sync Gist)
         env:
           SITE_COOKIE: ${{ secrets.SITE_COOKIE }}
           SITE_USERNAME: ${{ secrets.SITE_USERNAME }}
           SITE_PASSWORD: ${{ secrets.SITE_PASSWORD }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
         run: python scrape.py
 
       - name: Commit results back to repo
@@ -42,9 +44,3 @@ jobs:
             git commit -m "chore: update proxy list $(date -u +'%Y-%m-%d')"
             git push
           fi
-
-      - name: Upload to Gist
-        env:
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          GIST_ID: ${{ secrets.GIST_ID }}
-        run: python upload_gist.py
