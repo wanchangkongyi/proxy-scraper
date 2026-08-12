@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  actions: write   # 清理历史 workflow 运行记录需要这个权限
 
 jobs:
   scrape:
@@ -44,3 +45,11 @@ jobs:
             git commit -m "chore: update proxy list $(date -u +'%Y-%m-%d')"
             git push
           fi
+
+      - name: Clean up old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          retain_days: 30       # 保留最近 30 天内的运行记录
+          keep_minimum_runs: 10 # 无论如何至少保留最近 10 次，防止全清空
