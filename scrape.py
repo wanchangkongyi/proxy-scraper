@@ -5,12 +5,14 @@
 依赖：requests, beautifulsoup4
     pip install requests beautifulsoup4
 
-登录方式（二选一，优先 Cookie）：
-  A. Cookie 登录（推荐）：设置 SITE_COOKIE 环境变量为浏览器登录后
-     Network 面板里请求头的完整 Cookie 值，脚本直接带上这个 Cookie
-     访问代理列表页，不走登录表单。
-  B. 账号密码登录：未设置 SITE_COOKIE 时，用 SITE_USERNAME /
-     SITE_PASSWORD 自动解析并提交登录表单（详见 login()）。
+登录方式（可以同时配置，Cookie 优先，失效自动 fallback）：
+  A. Cookie 登录（推荐，优先尝试）：设置 SITE_COOKIE 环境变量为浏览器
+     登录后 Network 面板里请求头的完整 Cookie 值，脚本直接带上这个
+     Cookie 访问代理列表页，不走登录表单。
+  B. 账号密码登录：如果 SITE_COOKIE 未设置，或设置了但已失效，会用
+     SITE_USERNAME / SITE_PASSWORD 自动解析并提交登录表单（详见 login()）。
+     两种方式可以同时配置：Cookie 有效时优先用 Cookie（更快、更省请求），
+     Cookie 过期后自动切换到账号密码，不需要人工干预更新 Cookie。
 
 流程：
   1. 建立已认证的 session（Cookie 或 表单登录二选一）。
@@ -229,46 +231,67 @@ def upload_gist(proxies):
     print(f"Gist 已更新: {resp.json().get('html_url')}")
 
 
+def authenticate(session: requests.Session) -> bool:
+    """
+    认证优先级：
+      1. 如果配置了 SITE_COOKIE，先尝试 Cookie 登录。
+         - 成功：直接返回 True。
+         - 失败（Cookie 过期/无效）：如果同时配置了账号密码，自动
+           fallback 到表单登录；否则直接失败。
+      2. 没配置 SITE_COOKIE，直接走账号密码登录。
+    """
+    if SITE_COOKIE:
+        print("检测到 SITE_COOKIE，优先尝试 Cookie 登录 ...")
+        try:
+            if apply_cookie(session, SITE_COOKIE):
+                print("Cookie 有效，已登录。")
+                return True
+            print("Cookie 已失效（未找到'退出登录'字样）。", file=sys.stderr)
+        except requests.RequestException as e:
+            print(f"WARNING: 用 Cookie 访问代理列表失败: {e}", file=sys.stderr)
+
+        if not (SITE_USERNAME and SITE_PASSWORD):
+            print(
+                "ERROR: Cookie 失效，且未配置 SITE_USERNAME/SITE_PASSWORD 作为备用，"
+                "请重新登录网站更新 SITE_COOKIE，或补充账号密码。",
+                file=sys.stderr,
+            )
+            return False
+
+        print(f"Cookie 失效，自动改用账号密码登录 {LOGIN_URL} ...")
+        # Cookie 尝试失败后，session 里可能残留了失效的 cookie，清空重来
+        session.cookies.clear()
+
+    elif not (SITE_USERNAME and SITE_PASSWORD):
+        print(
+            "ERROR: 请设置 SITE_COOKIE，或设置 SITE_USERNAME + SITE_PASSWORD（可以两者都配，"
+            "Cookie 失效时会自动 fallback 到账号密码）。",
+            file=sys.stderr,
+        )
+        return False
+
+    try:
+        ok = login(session, LOGIN_URL, SITE_USERNAME, SITE_PASSWORD)
+    except requests.RequestException as e:
+        print(f"ERROR: 登录请求失败: {e}", file=sys.stderr)
+        return False
+
+    if not ok:
+        print(
+            "ERROR: 账号密码登录也失败了（响应里没有找到'退出登录'字样）。"
+            "请检查账号密码，或登录表单结构是否变化。",
+            file=sys.stderr,
+        )
+        return False
+
+    print("账号密码登录成功。")
+    return True
+
+
 def main():
     session = requests.Session()
 
-    if SITE_COOKIE:
-        print("检测到 SITE_COOKIE，使用 Cookie 登录方式 ...")
-        try:
-            ok = apply_cookie(session, SITE_COOKIE)
-        except requests.RequestException as e:
-            print(f"ERROR: 用 Cookie 访问代理列表失败: {e}", file=sys.stderr)
-            sys.exit(1)
-        if not ok:
-            print(
-                "ERROR: Cookie 似乎已失效（响应里没有找到'退出登录'字样）。"
-                "请重新登录网站，从浏览器 Network 面板复制最新的 Cookie 并更新 SITE_COOKIE。",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        print("Cookie 有效，已登录。")
-
-    elif SITE_USERNAME and SITE_PASSWORD:
-        print(f"未设置 SITE_COOKIE，改用账号密码登录 {LOGIN_URL} ...")
-        try:
-            ok = login(session, LOGIN_URL, SITE_USERNAME, SITE_PASSWORD)
-        except requests.RequestException as e:
-            print(f"ERROR: 登录请求失败: {e}", file=sys.stderr)
-            sys.exit(1)
-        if not ok:
-            print(
-                "ERROR: 登录似乎失败了（响应里没有找到'退出登录'字样）。"
-                "请检查账号密码，或登录表单结构是否变化。",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        print("登录成功。")
-
-    else:
-        print(
-            "ERROR: 请设置 SITE_COOKIE（推荐），或同时设置 SITE_USERNAME 和 SITE_PASSWORD。",
-            file=sys.stderr,
-        )
+    if not authenticate(session):
         sys.exit(1)
 
     print(f"正在抓取 {PROXY_LIST_URL} ...")
